@@ -7,14 +7,14 @@ use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComicInfo<'a> {
-    index: u32,
+    pub index: u32,
     #[serde(borrow)]
-    title: CowStr<'a>,
-    transcript: Option<CowStr<'a>>,
-    alt_text: Option<CowStr<'a>>,
-    wiki_url: CowStr<'a>,
-    xkcd_url: CowStr<'a>,
-    image_url: CowStr<'a>,
+    pub title: CowStr<'a>,
+    pub transcript: Option<CowStr<'a>>,
+    pub alt_text: Option<CowStr<'a>>,
+    pub wiki_url: CowStr<'a>,
+    pub xkcd_url: CowStr<'a>,
+    pub image_url: CowStr<'a>,
 }
 
 pub async fn crawl_and_save<P: AsRef<Path>>(path: P) -> Result<()> {
