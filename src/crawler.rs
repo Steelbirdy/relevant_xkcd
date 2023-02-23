@@ -1,22 +1,64 @@
 use select::{document::Document, predicate::*};
-use crate::{constants, Result};
-use std::{path::Path, io::BufWriter, fs::File};
+use crate::{constants, Result, utils::CowStr};
+use std::{path::Path, fs::File};
+use std::sync::Arc;
+use indicatif::MultiProgress;
 use serde::{Serialize, Deserialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComicInfo<'a> {
+    index: u32,
+    #[serde(borrow)]
+    title: CowStr<'a>,
+    transcript: Option<CowStr<'a>>,
+    alt_text: Option<CowStr<'a>>,
+    wiki_url: CowStr<'a>,
+    xkcd_url: CowStr<'a>,
+    image_url: CowStr<'a>,
+}
+
 pub async fn crawl_and_save<P: AsRef<Path>>(path: P) -> Result<()> {
+    async fn task(url: String, progress: Arc<MultiProgress>) -> Result<Vec<ComicInfo<'static>>> {
+        let comics = get_comic_table_data(&url).await?;
+        let bar = indicatif::ProgressBar::new(comics.len() as _);
+        let bar = progress.add(bar);
+        let mut ret = Vec::with_capacity(comics.len());
+        for comic in comics {
+            let info = get_comic_info(comic).await?;
+            ret.push(info);
+            bar.inc(1);
+        }
+        bar.finish();
+        Ok(ret)
+    }
+
     let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
 
     let urls = get_comic_table_urls().await?;
-    let mut all_comics = Vec::with_capacity(3000);
-    // for url in urls {
-    //     let comics = get_comic_info(&url).await?;
-    //     for comic in comics {
-    //
-    //     }
-    // }
+    let mut threads = tokio::task::JoinSet::new();
+    let progress = Arc::new(MultiProgress::new());
+    for url in urls {
+        threads.spawn(task(url, progress.clone()));
+    }
 
-    todo!()
+    let mut all_comics = Vec::with_capacity(3000);
+    while let Some(res) = threads.join_next().await {
+        let res = res.unwrap()?;
+        all_comics.extend(res);
+    }
+
+    all_comics.sort_by_key(|comic| comic.index);
+    serde_json::to_writer(file, &all_comics)?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ComicData {
+    index: u32,
+    title: String,
+    wiki_url: String,
+    xkcd_url: String,
+    image_url: String,
 }
 
 async fn get_comic_table_urls() -> Result<Vec<String>> {
@@ -39,25 +81,7 @@ async fn get_comic_table_urls() -> Result<Vec<String>> {
     }).collect())
 }
 
-#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
-pub struct ComicInfoRef<'a> {
-    index: u32,
-    title: &'a str,
-    wiki_url: &'a str,
-    xkcd_url: &'a str,
-    image_url: &'a str,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ComicInfo {
-    index: u32,
-    title: String,
-    wiki_url: String,
-    xkcd_url: String,
-    image_url: String,
-}
-
-async fn get_comic_info(table_url: &str) -> Result<Vec<ComicInfo>> {
+async fn get_comic_table_data(table_url: &str) -> Result<Vec<ComicData>> {
     let res = reqwest::get(table_url)
         .await?
         .text()
@@ -88,21 +112,61 @@ async fn get_comic_info(table_url: &str) -> Result<Vec<ComicInfo>> {
         let title = c2.text();
 
         let wiki_url = extract_link(&c2);
-        let wiki_url = format!("{}{wiki_url}", constants::URL_BASE);
 
         let image_url = extract_link(&c4);
-        let image_url = format!("{}{image_url}", constants::URL_BASE);
 
-        ret.push(ComicInfo {
+        ret.push(ComicData {
             index,
             title,
-            wiki_url,
+            wiki_url: wiki_url.to_string(),
             xkcd_url,
-            image_url,
+            image_url: image_url.to_string(),
         });
     }
 
     Ok(ret)
+}
+
+async fn get_comic_info(comic: ComicData) -> Result<ComicInfo<'static>> {
+    let res = reqwest::get(format!("{}{}", constants::URL_BASE, &comic.wiki_url))
+        .await?
+        .text()
+        .await?;
+
+    let alt_text_predicate = Name("body")
+        .descendant(Attr("id", "mw-content-text"))
+        .child(Class("mw-parser-output"))
+        .child(Name("table"))
+        .descendant(Attr("href", comic.image_url.as_str()));
+    let doc = Document::from(res.as_str());
+    let alt_text = doc
+        .find(alt_text_predicate)
+        .next()
+        .and_then(|node| node.attr("title"))
+        .map(ToString::to_string);
+
+    let transcript_predicate = Name("body")
+        .descendant(Attr("id", "mw-content-text"))
+        .child(Class("mw-parser-output"))
+        .child(Or(Or(Name("h2"), Name("dl")), Name("p")));
+    let transcript = doc
+        .find(transcript_predicate)
+        .map(|dl| dl.text())
+        .skip_while(|text| text != "Transcript[edit]")
+        .skip(1)
+        .take_while(|text| !text.is_empty() && !text.ends_with("[edit]") && !text.chars().all(|c| c.is_whitespace()))
+        .reduce(|a, b| format!("{a}\n{b}"));
+
+    let ComicData { index, title, wiki_url, xkcd_url, image_url } = comic;
+    Ok(ComicInfo {
+        index,
+        title: title.into(),
+        transcript: transcript.map(Into::into),
+        alt_text: alt_text.map(Into::into),
+        wiki_url: wiki_url.into(),
+        xkcd_url: xkcd_url.into(),
+        image_url: image_url.into(),
+    })
 }
 
 #[track_caller]
@@ -111,12 +175,8 @@ fn extract_link<'a>(node: &'a select::node::Node) -> &'a str {
         return ret;
     }
 
-    fn inner<'a>(node: &'a select::node::Node) -> Option<&'a str> {
-        node.find(Attr("href", ()))
-            .next()?
-            .attr("href")
-    }
-
-    inner(node)
+    node.find(Attr("href", ()))
+        .next()
+        .and_then(|node| node.attr("href"))
         .unwrap_or_else(|| panic!("attempted to extract link from node: `{}`", node.html()))
 }

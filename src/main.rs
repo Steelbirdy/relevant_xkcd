@@ -1,19 +1,10 @@
 mod constants;
 mod crawler;
+mod utils;
 
-
-
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let urls = get_comic_table_urls().await?;
-    let mut all_comics = Vec::with_capacity(3000);
-    for url in urls {
-        let info = get_comic_info(&url).await?;
-        all_comics.extend(info);
-    }
-
-    Ok(())
+    crawler::crawl_and_save("output.json").await
 }
-
