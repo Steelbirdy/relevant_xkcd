@@ -1,9 +1,10 @@
+use crate::{constants, utils::CowStr, Result};
+use reqwest::Client;
 use select::{document::Document, predicate::*};
-use crate::{constants, Result, utils::CowStr};
-use std::{path::Path, fs::File};
-use std::sync::Arc;
-use indicatif::MultiProgress;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use std::{fs::File, path::Path};
+
+const CHUNK_SIZE: usize = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComicInfo<'a> {
@@ -18,37 +19,51 @@ pub struct ComicInfo<'a> {
 }
 
 pub async fn crawl_and_save<P: AsRef<Path>>(path: P) -> Result<()> {
-    async fn task(url: String, progress: Arc<MultiProgress>) -> Result<Vec<ComicInfo<'static>>> {
-        let comics = get_comic_table_data(&url).await?;
-        let bar = indicatif::ProgressBar::new(comics.len() as _);
-        let bar = progress.add(bar);
-        let mut ret = Vec::with_capacity(comics.len());
-        for comic in comics {
-            let info = get_comic_info(comic).await?;
-            ret.push(info);
-            bar.inc(1);
-        }
-        bar.finish();
-        Ok(ret)
-    }
-
     let file = File::create(path)?;
+    crawl_and_save_inner(file).await
+}
 
-    let urls = get_comic_table_urls().await?;
-    let mut threads = tokio::task::JoinSet::new();
-    let progress = Arc::new(MultiProgress::new());
+async fn crawl_and_save_inner(file: File) -> Result<()> {
+    let client = Client::new();
+    let urls = get_comic_table_urls(&client).await?;
+
+    let mut comic_data = Vec::with_capacity(3000);
     for url in urls {
-        threads.spawn(task(url, progress.clone()));
+        let data = get_comic_table_data(&client, &url).await?;
+        comic_data.extend(data);
     }
 
-    let mut all_comics = Vec::with_capacity(3000);
-    while let Some(res) = threads.join_next().await {
-        let res = res.unwrap()?;
-        all_comics.extend(res);
+    let num_comics = comic_data.len();
+    let progress = indicatif::ProgressBar::new(num_comics as _);
+
+    let mut pool = tokio::task::JoinSet::new();
+
+    while !comic_data.is_empty() {
+        let start = comic_data.len() - comic_data.len().min(CHUNK_SIZE);
+        let chunk = comic_data.split_off(start);
+
+        let client = client.clone();
+        let progress = progress.clone();
+        pool.spawn(async move {
+            let mut ret = Vec::with_capacity(chunk.len());
+            for comic in chunk {
+                let info = get_comic_info(&client, comic).await?;
+                progress.inc(1);
+                ret.push(info);
+            }
+            Result::Ok(ret)
+        });
     }
 
-    all_comics.sort_by_key(|comic| comic.index);
-    serde_json::to_writer(file, &all_comics)?;
+    let mut comics = Vec::with_capacity(num_comics);
+    while let Some(c) = pool.join_next().await {
+        let c = c.unwrap()?;
+        comics.extend(c);
+    }
+    progress.finish();
+
+    comics.sort_by_key(|comic| comic.index);
+    serde_json::to_writer(file, &comics)?;
     Ok(())
 }
 
@@ -61,8 +76,10 @@ struct ComicData {
     image_url: String,
 }
 
-async fn get_comic_table_urls() -> Result<Vec<String>> {
-    let res = reqwest::get(constants::FULL_COMICS_LIST_URL)
+async fn get_comic_table_urls(client: &Client) -> Result<Vec<String>> {
+    let res = client
+        .get(constants::FULL_COMICS_LIST_URL)
+        .send()
         .await?
         .text()
         .await?;
@@ -75,17 +92,16 @@ async fn get_comic_table_urls() -> Result<Vec<String>> {
     let doc = Document::from(res.as_str());
     let nodes = doc.find(predicate);
 
-    Ok(nodes.map(move |node| {
-        let link = extract_link(&node);
-        format!("{}{link}", constants::URL_BASE)
-    }).collect())
+    Ok(nodes
+        .map(move |node| {
+            let link = extract_link(&node);
+            format!("{}{link}", constants::URL_BASE)
+        })
+        .collect())
 }
 
-async fn get_comic_table_data(table_url: &str) -> Result<Vec<ComicData>> {
-    let res = reqwest::get(table_url)
-        .await?
-        .text()
-        .await?;
+async fn get_comic_table_data(client: &Client, table_url: &str) -> Result<Vec<ComicData>> {
+    let res = client.get(table_url).send().await?.text().await?;
 
     let predicate = Name("body")
         .descendant(Attr("id", "mw-content-text"))
@@ -98,7 +114,12 @@ async fn get_comic_table_data(table_url: &str) -> Result<Vec<ComicData>> {
     let mut ret = Vec::new();
     for row in rows {
         let mut cells = row.find(Name("td"));
-        let (c1, c2, _, c4) = (cells.next().unwrap(), cells.next().unwrap(), cells.next(), cells.next().unwrap());
+        let (c1, c2, _, c4) = (
+            cells.next().unwrap(),
+            cells.next().unwrap(),
+            cells.next(),
+            cells.next().unwrap(),
+        );
 
         let (xkcd_url, index) = {
             let text = c1.text();
@@ -127,8 +148,10 @@ async fn get_comic_table_data(table_url: &str) -> Result<Vec<ComicData>> {
     Ok(ret)
 }
 
-async fn get_comic_info(comic: ComicData) -> Result<ComicInfo<'static>> {
-    let res = reqwest::get(format!("{}{}", constants::URL_BASE, &comic.wiki_url))
+async fn get_comic_info(client: &Client, comic: ComicData) -> Result<ComicInfo<'static>> {
+    let res = client
+        .get(format!("{}{}", constants::URL_BASE, &comic.wiki_url))
+        .send()
         .await?
         .text()
         .await?;
@@ -154,10 +177,20 @@ async fn get_comic_info(comic: ComicData) -> Result<ComicInfo<'static>> {
         .map(|dl| dl.text())
         .skip_while(|text| text != "Transcript[edit]")
         .skip(1)
-        .take_while(|text| !text.is_empty() && !text.ends_with("[edit]") && !text.chars().all(|c| c.is_whitespace()))
+        .take_while(|text| {
+            !text.is_empty()
+                && !text.ends_with("[edit]")
+                && !text.chars().all(|c| c.is_whitespace())
+        })
         .reduce(|a, b| format!("{a}\n{b}"));
 
-    let ComicData { index, title, wiki_url, xkcd_url, image_url } = comic;
+    let ComicData {
+        index,
+        title,
+        wiki_url,
+        xkcd_url,
+        image_url,
+    } = comic;
     Ok(ComicInfo {
         index,
         title: title.into(),

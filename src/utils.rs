@@ -1,5 +1,5 @@
+use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, ops::Deref};
-use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct CowStr<'a>(#[serde(borrow)] pub Cow<'a, str>);
